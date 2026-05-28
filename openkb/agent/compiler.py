@@ -14,11 +14,13 @@ summary prefix across N+M concept-generation calls). Providers that do not
 support cache_control receive a normalized list-of-blocks content payload,
 which LiteLLM passes through cleanly.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -26,7 +28,9 @@ import time
 import unicodedata
 from pathlib import Path
 
-import litellm
+from agno.agent import Agent as AgnoAgent
+from agno.models.openai.like import OpenAILike
+from agno.models.message import Message
 
 from openkb.lint import list_existing_wiki_targets, strip_ghost_wikilinks
 from openkb.schema import get_agents_md
@@ -177,6 +181,7 @@ Return ONLY the Markdown content (no frontmatter, no code fences).
 # LLM helpers
 # ---------------------------------------------------------------------------
 
+
 def _cached_text(text: str) -> list[dict]:
     """Wrap a text payload into a content-block list with an Anthropic
     ephemeral cache_control marker.
@@ -246,49 +251,131 @@ def _fmt_messages(messages: list[dict], max_content: int = 200) -> str:
     return "\n".join(parts)
 
 
-def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str:
-    """Single LLM call with animated progress and debug logging."""
-    logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
-    if kwargs:
-        logger.debug("LLM kwargs [%s]: %s", step_name, kwargs)
+def _make_model(kb_dir: Path | None = None) -> OpenAILike:
+    """Build an OpenAILike model from KB config or env vars.
 
+    Priority: KB config (.openkb/config.yaml) → env vars (OPENAI_*).
+    """
+    import os
+    from openkb.config import load_config
+
+    cfg: dict = {}
+    if kb_dir is not None:
+        config_path = kb_dir / ".openkb" / "config.yaml"
+        if config_path.exists():
+            cfg = load_config(config_path)
+
+    model_id = cfg.get("openai_model_name") or os.environ.get(
+        "OPENAI_MODEL_NAME", "gpt-4o-mini"
+    )
+    base_url = cfg.get("openai_base_url") or os.environ.get(
+        "OPENAI_BASE_URL", "https://api.openai.com/v1"
+    )
+    api_key = cfg.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
+    _extra_body_env = os.environ.get("OPENAI_EXTRA_BODY", "")
+    extra_body = cfg.get("openai_extra_body") or (
+        json.loads(_extra_body_env) if _extra_body_env else {}
+    )
+
+    return OpenAILike(
+        id=model_id,
+        base_url=base_url,
+        api_key=api_key,
+        extra_body=extra_body,
+    )
+
+
+def _to_agno_messages(messages: list[dict]) -> list[Message]:
+    """Convert OpenAI-style message dicts to agno Message objects.
+
+    Flattens list-of-blocks content (cache_control shape) to plain text.
+    """
+    result = []
+    for m in messages:
+        raw = m["content"]
+        text = (
+            "".join(b.get("text", "") for b in raw if isinstance(b, dict))
+            if isinstance(raw, list)
+            else (raw or "")
+        )
+        result.append(Message(role=m["role"], content=text))
+    return result
+
+
+def _llm_call(
+    model: str,
+    messages: list[dict],
+    step_name: str,
+    kb_dir: Path | None = None,
+    use_json: bool = False,
+    **kwargs,
+) -> str:
+    """Single LLM call via agno Agent with animated progress and debug logging."""
+    logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
+
+    agno_msgs = _to_agno_messages(messages)
     spinner = _Spinner(step_name)
     spinner.start()
     t0 = time.time()
 
-    response = litellm.completion(model=model, messages=messages, **kwargs)
-    content = response.choices[0].message.content or ""
+    agent = AgnoAgent(
+        model=_make_model(kb_dir),
+        use_json_mode=use_json,
+        debug_mode=logger.isEnabledFor(logging.DEBUG),
+    )
+    response = agent.run(input=agno_msgs)
+    content = response.content or ""
 
-    spinner.stop(_format_usage(time.time() - t0, response.usage))
-    logger.debug("LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else ""))
+    spinner.stop(f"{time.time() - t0:.1f}s")
+    logger.debug(
+        "LLM response [%s]:\n%s",
+        step_name,
+        content[:500] + ("..." if len(content) > 500 else ""),
+    )
     return content.strip()
 
 
-async def _llm_call_async(model: str, messages: list[dict], step_name: str, **kwargs) -> str:
-    """Async LLM call with timing output and debug logging."""
+async def _llm_call_async(
+    model: str,
+    messages: list[dict],
+    step_name: str,
+    kb_dir: Path | None = None,
+    use_json: bool = False,
+    **kwargs,
+) -> str:
+    """Async LLM call via agno Agent with timing output and debug logging."""
     logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
-    if kwargs:
-        logger.debug("LLM kwargs [%s]: %s", step_name, kwargs)
 
+    agno_msgs = _to_agno_messages(messages)
     t0 = time.time()
 
-    response = await litellm.acompletion(model=model, messages=messages, **kwargs)
-    content = response.choices[0].message.content or ""
+    agent = AgnoAgent(
+        model=_make_model(kb_dir),
+        use_json_mode=use_json,
+        debug_mode=logger.isEnabledFor(logging.DEBUG),
+    )
+    response = await agent.arun(input=agno_msgs)
+    content = response.content or ""
 
     elapsed = time.time() - t0
-    sys.stdout.write(f"    {step_name}... {_format_usage(elapsed, response.usage)}\n")
+    sys.stdout.write(f"    {step_name}... {elapsed:.1f}s\n")
     sys.stdout.flush()
-    logger.debug("LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else ""))
+    logger.debug(
+        "LLM response [%s]:\n%s",
+        step_name,
+        content[:500] + ("..." if len(content) > 500 else ""),
+    )
     return content.strip()
 
 
 def _parse_json(text: str) -> list | dict:
     """Parse JSON from LLM response, handling fences, prose, and malformed JSON."""
     from json_repair import repair_json
+
     cleaned = text.strip()
     if cleaned.startswith("```"):
         first_nl = cleaned.find("\n")
-        cleaned = cleaned[first_nl + 1:] if first_nl != -1 else cleaned[3:]
+        cleaned = cleaned[first_nl + 1 :] if first_nl != -1 else cleaned[3:]
         if cleaned.endswith("```"):
             cleaned = cleaned[:-3]
     result = json.loads(repair_json(cleaned.strip()))
@@ -301,13 +388,20 @@ def _parse_json(text: str) -> list | dict:
 # File I/O helpers
 # ---------------------------------------------------------------------------
 
+
 def _read_wiki_context(wiki_dir: Path) -> tuple[str, list[str]]:
     """Read current index.md content and list of existing concept slugs."""
     index_path = wiki_dir / "index.md"
-    index_content = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+    index_content = (
+        index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+    )
 
     concepts_dir = wiki_dir / "concepts"
-    existing = sorted(p.stem for p in concepts_dir.glob("*.md")) if concepts_dir.exists() else []
+    existing = (
+        sorted(p.stem for p in concepts_dir.glob("*.md"))
+        if concepts_dir.exists()
+        else []
+    )
 
     return index_content, existing
 
@@ -337,11 +431,11 @@ def _read_concept_briefs(wiki_dir: Path) -> str:
         if text.startswith("---"):
             end = text.find("---", 3)
             if end != -1:
-                fm = text[:end + 3]
-                body = text[end + 3:]
+                fm = text[: end + 3]
+                body = text[end + 3 :]
                 for line in fm.split("\n"):
                     if line.startswith("brief:"):
-                        brief = line[len("brief:"):].strip()
+                        brief = line[len("brief:") :].strip()
                         break
         if not brief:
             brief = body.strip().replace("\n", " ")[:150]
@@ -363,9 +457,7 @@ def _iter_h2_headings(lines: list[str]) -> list[tuple[int, str]]:
     boundary share one scan and one normalization rule.
     """
     return [
-        (i, line.rstrip())
-        for i, line in enumerate(lines)
-        if line.startswith("## ")
+        (i, line.rstrip()) for i, line in enumerate(lines) if line.startswith("## ")
     ]
 
 
@@ -419,7 +511,9 @@ def _section_contains_link(lines: list[str], heading: str, link: str) -> bool:
     return any(line.startswith(entry_prefix) for line in lines[start:end])
 
 
-def _replace_section_entry(lines: list[str], heading: str, link: str, entry: str) -> bool:
+def _replace_section_entry(
+    lines: list[str], heading: str, link: str, entry: str
+) -> bool:
     """Replace the first matching entry within a specific section."""
     bounds = _get_section_bounds(lines, heading)
     if bounds is None:
@@ -467,14 +561,14 @@ def _remove_section_entry(lines: list[str], heading: str, link: str) -> bool:
     return False
 
 
-
-def _write_summary(wiki_dir: Path, doc_name: str, summary: str,
-                    doc_type: str = "short") -> None:
+def _write_summary(
+    wiki_dir: Path, doc_name: str, summary: str, doc_type: str = "short"
+) -> None:
     """Write summary page with frontmatter."""
     if summary.startswith("---"):
         end = summary.find("---", 3)
         if end != -1:
-            summary = summary[end + 3:].lstrip("\n")
+            summary = summary[end + 3 :].lstrip("\n")
     summaries_dir = wiki_dir / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
     ext = "md" if doc_type == "short" else "json"
@@ -483,10 +577,12 @@ def _write_summary(wiki_dir: Path, doc_name: str, summary: str,
         f"full_text: sources/{doc_name}.{ext}",
     ]
     frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-    (summaries_dir / f"{doc_name}.md").write_text(frontmatter + summary, encoding="utf-8")
+    (summaries_dir / f"{doc_name}.md").write_text(
+        frontmatter + summary, encoding="utf-8"
+    )
 
 
-_SAFE_NAME_RE = re.compile(r'[^\w\-]')
+_SAFE_NAME_RE = re.compile(r"[^\w\-]")
 
 
 def _sanitize_concept_name(name: str) -> str:
@@ -496,7 +592,14 @@ def _sanitize_concept_name(name: str) -> str:
     return sanitized or "unnamed-concept"
 
 
-def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is_update: bool, brief: str = "") -> None:
+def _write_concept(
+    wiki_dir: Path,
+    name: str,
+    content: str,
+    source_file: str,
+    is_update: bool,
+    brief: str = "",
+) -> None:
     """Write or update a concept page, managing the sources frontmatter."""
     concepts_dir = wiki_dir / "concepts"
     concepts_dir.mkdir(parents=True, exist_ok=True)
@@ -515,12 +618,12 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         if clean.startswith("---"):
             end = clean.find("---", 3)
             if end != -1:
-                clean = clean[end + 3:].lstrip("\n")
+                clean = clean[end + 3 :].lstrip("\n")
         # Replace body with LLM rewrite (prompt asks for full rewrite, not delta)
         if existing.startswith("---"):
             end = existing.find("---", 3)
             if end != -1:
-                existing = existing[:end + 3] + "\n\n" + clean
+                existing = existing[: end + 3] + "\n\n" + clean
             else:
                 existing = clean
         else:
@@ -528,8 +631,8 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         if brief and existing.startswith("---"):
             end = existing.find("---", 3)
             if end != -1:
-                fm = existing[:end + 3]
-                body = existing[end + 3:]
+                fm = existing[: end + 3]
+                body = existing[end + 3 :]
                 if "brief:" in fm:
                     fm = re.sub(r"brief:.*", f"brief: {brief}", fm)
                 else:
@@ -540,7 +643,7 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         if content.startswith("---"):
             end = content.find("---", 3)
             if end != -1:
-                content = content[end + 3:].lstrip("\n")
+                content = content[end + 3 :].lstrip("\n")
         fm_lines = [f"sources: [{source_file}]"]
         if brief:
             fm_lines.append(f"brief: {brief}")
@@ -573,7 +676,7 @@ def _prepend_source_to_frontmatter(text: str, source_file: str) -> str:
         rb = line.rfind("]")
         if lb == -1 or rb == -1 or rb < lb:
             return text
-        items = [s.strip() for s in line[lb + 1:rb].split(",") if s.strip()]
+        items = [s.strip() for s in line[lb + 1 : rb].split(",") if s.strip()]
         if source_file in items:
             return text
         items.insert(0, source_file)
@@ -612,7 +715,7 @@ def _remove_source_from_frontmatter(text: str, source_file: str) -> tuple[str, b
         rb = line.rfind("]")
         if lb == -1 or rb == -1 or rb < lb:
             return text, False
-        items = [s.strip() for s in line[lb + 1:rb].split(",") if s.strip()]
+        items = [s.strip() for s in line[lb + 1 : rb].split(",") if s.strip()]
         if source_file not in items:
             return text, False
         items.remove(source_file)
@@ -622,7 +725,9 @@ def _remove_source_from_frontmatter(text: str, source_file: str) -> tuple[str, b
     return text, False
 
 
-def _add_related_link(wiki_dir: Path, concept_slug: str, doc_name: str, source_file: str) -> None:
+def _add_related_link(
+    wiki_dir: Path, concept_slug: str, doc_name: str, source_file: str
+) -> None:
     """Add a cross-reference link to an existing concept page (no LLM call)."""
     concepts_dir = wiki_dir / "concepts"
     path = concepts_dir / f"{concept_slug}.md"
@@ -782,7 +887,9 @@ def remove_doc_from_concept_pages(
     return {"modified": modified, "deleted": deleted}
 
 
-def remove_doc_from_index(wiki_dir: Path, doc_name: str, concept_slugs_deleted: list[str]) -> None:
+def remove_doc_from_index(
+    wiki_dir: Path, doc_name: str, concept_slugs_deleted: list[str]
+) -> None:
     """Remove the document's entry from ``index.md`` along with any concept
     entries for concepts that were deleted as a side effect.
 
@@ -809,8 +916,11 @@ def remove_doc_from_index(wiki_dir: Path, doc_name: str, concept_slugs_deleted: 
 
 
 def _update_index(
-    wiki_dir: Path, doc_name: str, concept_names: list[str],
-    doc_brief: str = "", concept_briefs: dict[str, str] | None = None,
+    wiki_dir: Path,
+    doc_name: str,
+    concept_names: list[str],
+    doc_brief: str = "",
+    concept_briefs: dict[str, str] | None = None,
     doc_type: str = "short",
 ) -> None:
     """Append document and concept entries to index.md.
@@ -852,7 +962,9 @@ def _update_index(
             concept_entry += f" — {concept_briefs[name]}"
         if _section_contains_link(lines, "## Concepts", concept_link):
             if name in concept_briefs:
-                _replace_section_entry(lines, "## Concepts", concept_link, concept_entry)
+                _replace_section_entry(
+                    lines, "## Concepts", concept_link, concept_entry
+                )
         else:
             _insert_section_entry(lines, "## Concepts", concept_entry)
 
@@ -904,14 +1016,23 @@ async def _compile_concepts(
     # (system + doc + summary) for the plan call and every concept call.
     summary_msg = {"role": "assistant", "content": _cached_text(summary)}
 
-    plan_raw = _llm_call(model, [
-        system_msg,
-        doc_msg,
-        summary_msg,
-        {"role": "user", "content": _CONCEPTS_PLAN_USER.format(
-            concept_briefs=concept_briefs,
-        )},
-    ], "concepts-plan", max_tokens=1024)
+    plan_raw = _llm_call(
+        model,
+        [
+            system_msg,
+            doc_msg,
+            summary_msg,
+            {
+                "role": "user",
+                "content": _CONCEPTS_PLAN_USER.format(
+                    concept_briefs=concept_briefs,
+                ),
+            },
+        ],
+        "concepts-plan",
+        kb_dir=kb_dir,
+        use_json=True,
+    )
 
     def _write_v1_summary_stripped() -> None:
         """Fallback writer for the v1 summary on early-return paths.
@@ -928,7 +1049,9 @@ async def _compile_concepts(
         if ghosts:
             logger.info(
                 "stripped %d ghost wikilink(s) from fallback v1 summary %s: %s",
-                len(ghosts), doc_name, ghosts[:5],
+                len(ghosts),
+                doc_name,
+                ghosts[:5],
             )
         _write_summary(wiki_dir, doc_name, cleaned)
 
@@ -968,9 +1091,7 @@ async def _compile_concepts(
     # summary about to be written for this document.
     planned_slugs = {
         _sanitize_concept_name(c["name"]) for c in create_items + update_items
-    } | {
-        _sanitize_concept_name(s) for s in related_items
-    }
+    } | {_sanitize_concept_name(s) for s in related_items}
     known_targets: set[str] = (
         list_existing_wiki_targets(wiki_dir)
         | {f"concepts/{s}" for s in planned_slugs}
@@ -989,9 +1110,11 @@ async def _compile_concepts(
     # via _CONCEPTS_PLAN_USER instead.
     known_targets_msg = {
         "role": "user",
-        "content": _cached_text(_KNOWN_TARGETS_USER.format(
-            known_targets=known_targets_str,
-        )),
+        "content": _cached_text(
+            _KNOWN_TARGETS_USER.format(
+                known_targets=known_targets_str,
+            )
+        ),
     }
 
     # --- Step 3: Generate/update concept pages concurrently (A cached) ---
@@ -1001,16 +1124,26 @@ async def _compile_concepts(
         name = concept["name"]
         title = concept.get("title", name)
         async with semaphore:
-            raw = await _llm_call_async(model, [
-                system_msg,
-                doc_msg,             # cached (BP1)
-                summary_msg,         # cached (BP2)
-                known_targets_msg,   # cached (BP3) — whitelist
-                {"role": "user", "content": _CONCEPT_PAGE_USER.format(
-                    title=title, doc_name=doc_name,
-                    update_instruction="",
-                )},
-            ], f"concept: {name}")
+            raw = await _llm_call_async(
+                model,
+                [
+                    system_msg,
+                    doc_msg,  # cached (BP1)
+                    summary_msg,  # cached (BP2)
+                    known_targets_msg,  # cached (BP3) — whitelist
+                    {
+                        "role": "user",
+                        "content": _CONCEPT_PAGE_USER.format(
+                            title=title,
+                            doc_name=doc_name,
+                            update_instruction="",
+                        ),
+                    },
+                ],
+                f"concept: {name}",
+                kb_dir=kb_dir,
+                use_json=True,
+            )
         try:
             parsed = _parse_json(raw)
             brief = parsed.get("brief", "")
@@ -1033,16 +1166,26 @@ async def _compile_concepts(
         else:
             existing_content = "(page not found — create from scratch)"
         async with semaphore:
-            raw = await _llm_call_async(model, [
-                system_msg,
-                doc_msg,             # cached (BP1)
-                summary_msg,         # cached (BP2)
-                known_targets_msg,   # cached (BP3) — whitelist
-                {"role": "user", "content": _CONCEPT_UPDATE_USER.format(
-                    title=title, doc_name=doc_name,
-                    existing_content=existing_content,
-                )},
-            ], f"update: {name}")
+            raw = await _llm_call_async(
+                model,
+                [
+                    system_msg,
+                    doc_msg,  # cached (BP1)
+                    summary_msg,  # cached (BP2)
+                    known_targets_msg,  # cached (BP3) — whitelist
+                    {
+                        "role": "user",
+                        "content": _CONCEPT_UPDATE_USER.format(
+                            title=title,
+                            doc_name=doc_name,
+                            existing_content=existing_content,
+                        ),
+                    },
+                ],
+                f"update: {name}",
+                kb_dir=kb_dir,
+                use_json=True,
+            )
         try:
             parsed = _parse_json(raw)
             brief = parsed.get("brief", "")
@@ -1061,7 +1204,9 @@ async def _compile_concepts(
 
     if tasks:
         total = len(tasks)
-        sys.stdout.write(f"    Generating {total} concept(s) (concurrency={max_concurrency})...\n")
+        sys.stdout.write(
+            f"    Generating {total} concept(s) (concurrency={max_concurrency})...\n"
+        )
         sys.stdout.flush()
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1085,7 +1230,9 @@ async def _compile_concepts(
         if ghosts:
             logger.info(
                 "stripped %d ghost wikilink(s) from concept %s: %s",
-                len(ghosts), name, ghosts[:5],
+                len(ghosts),
+                name,
+                ghosts[:5],
             )
         pending_writes[i] = (name, cleaned, is_update, brief)
 
@@ -1101,33 +1248,39 @@ async def _compile_concepts(
         try:
             # No max_tokens cap — matches the v1 summary call. The rewrite
             # prompt asks the model to keep length within ±20% of the v1.
-            rewrite_raw = _llm_call(model, [
-                system_msg,
-                doc_msg,            # cached (BP1)
-                summary_msg,        # cached (BP2) — contains the v1 summary text
-                known_targets_msg,  # cached (BP3) — whitelist
-                {"role": "user", "content": _SUMMARY_REWRITE_USER},
-            ], "summary-rewrite")
+            rewrite_raw = _llm_call(
+                model,
+                [
+                    system_msg,
+                    doc_msg,  # cached (BP1)
+                    summary_msg,  # cached (BP2) — contains the v1 summary text
+                    known_targets_msg,  # cached (BP3) — whitelist
+                    {"role": "user", "content": _SUMMARY_REWRITE_USER},
+                ],
+                "summary-rewrite",
+                kb_dir=kb_dir,
+            )
             candidate = rewrite_raw.strip()
             # Strip frontmatter if the model added one anyway.
             if candidate.startswith("---"):
                 end = candidate.find("---", 3)
                 if end != -1:
-                    candidate = candidate[end + 3:].lstrip("\n")
+                    candidate = candidate[end + 3 :].lstrip("\n")
             # Safety net: strip any wikilink the rewrite emitted that is
             # not in the whitelist.
-            candidate, summary_ghosts = strip_ghost_wikilinks(
-                candidate, known_targets
-            )
+            candidate, summary_ghosts = strip_ghost_wikilinks(candidate, known_targets)
             if summary_ghosts:
                 logger.info(
                     "stripped %d ghost wikilink(s) from summary %s: %s",
-                    len(summary_ghosts), doc_name, summary_ghosts[:5],
+                    len(summary_ghosts),
+                    doc_name,
+                    summary_ghosts[:5],
                 )
         except Exception as exc:
             logger.warning(
                 "summary-rewrite failed for %s: %s. Falling back to v1.",
-                doc_name, exc,
+                doc_name,
+                exc,
             )
             candidate = None
 
@@ -1143,19 +1296,27 @@ async def _compile_concepts(
                     doc_name,
                 )
             final_summary, fallback_ghosts = strip_ghost_wikilinks(
-                summary, known_targets,
+                summary,
+                known_targets,
             )
             if fallback_ghosts:
                 logger.info(
                     "stripped %d ghost wikilink(s) from v1 fallback summary %s: %s",
-                    len(fallback_ghosts), doc_name, fallback_ghosts[:5],
+                    len(fallback_ghosts),
+                    doc_name,
+                    fallback_ghosts[:5],
                 )
         _write_summary(wiki_dir, doc_name, final_summary)
 
     # --- Write concept pages to disk ---
     for name, page_content, is_update, brief in pending_writes:
         _write_concept(
-            wiki_dir, name, page_content, source_file, is_update, brief=brief,
+            wiki_dir,
+            name,
+            page_content,
+            source_file,
+            is_update,
+            brief=brief,
         )
 
     # --- Step 3b: Process related items (code only, no LLM) ---
@@ -1170,9 +1331,14 @@ async def _compile_concepts(
         _backlink_concepts(wiki_dir, doc_name, all_concept_slugs)
 
     # --- Step 4: Update index (code only) ---
-    _update_index(wiki_dir, doc_name, concept_names,
-                  doc_brief=doc_brief, concept_briefs=concept_briefs_map,
-                  doc_type=doc_type)
+    _update_index(
+        wiki_dir,
+        doc_name,
+        concept_names,
+        doc_brief=doc_brief,
+        concept_briefs=concept_briefs_map,
+        doc_type=doc_type,
+    )
 
 
 async def compile_short_doc(
@@ -1200,19 +1366,31 @@ async def compile_short_doc(
     # Base context A: system + document. cache_control marker on the doc
     # message creates a cache breakpoint that covers (system + doc) for
     # every downstream call (summary, concepts-plan, every concept page).
-    system_msg = {"role": "system", "content": _SYSTEM_TEMPLATE.format(
-        schema_md=schema_md, language=language,
-    )}
-    doc_msg = {"role": "user", "content": _cached_text(_SUMMARY_USER.format(
-        doc_name=doc_name, content=content,
-    ))}
+    system_msg = {
+        "role": "system",
+        "content": _SYSTEM_TEMPLATE.format(
+            schema_md=schema_md,
+            language=language,
+        ),
+    }
+    doc_msg = {
+        "role": "user",
+        "content": _cached_text(
+            _SUMMARY_USER.format(
+                doc_name=doc_name,
+                content=content,
+            )
+        ),
+    }
 
     # --- Step 1: Generate summary (v1, held in memory) ---
     # The summary is NOT written to disk yet — it's used as cache context
     # for the plan + concept-generation calls, then rewritten into a final
     # v2 (with a whitelist of known wikilink targets) inside
     # _compile_concepts before being written to disk.
-    summary_raw = _llm_call(model, [system_msg, doc_msg], "summary")
+    summary_raw = _llm_call(
+        model, [system_msg, doc_msg], "summary", kb_dir=kb_dir, use_json=True
+    )
     try:
         summary_parsed = _parse_json(summary_raw)
         doc_brief = summary_parsed.get("brief", "")
@@ -1223,9 +1401,17 @@ async def compile_short_doc(
 
     # --- Steps 2-4: Concept plan → generate/update → summary rewrite → index ---
     await _compile_concepts(
-        wiki_dir, kb_dir, model, system_msg, doc_msg,
-        summary, doc_name, max_concurrency, doc_brief=doc_brief,
-        doc_type="short", rewrite_summary=True,
+        wiki_dir,
+        kb_dir,
+        model,
+        system_msg,
+        doc_msg,
+        summary,
+        doc_name,
+        max_concurrency,
+        doc_brief=doc_brief,
+        doc_type="short",
+        rewrite_summary=True,
     )
 
 
@@ -1255,19 +1441,37 @@ async def compile_long_doc(
 
     # Base context A. cache_control marker on the doc message creates a
     # cache breakpoint covering (system + doc) for every concept call.
-    system_msg = {"role": "system", "content": _SYSTEM_TEMPLATE.format(
-        schema_md=schema_md, language=language,
-    )}
-    doc_msg = {"role": "user", "content": _cached_text(_LONG_DOC_SUMMARY_USER.format(
-        doc_name=doc_name, doc_id=doc_id, content=summary_content,
-    ))}
+    system_msg = {
+        "role": "system",
+        "content": _SYSTEM_TEMPLATE.format(
+            schema_md=schema_md,
+            language=language,
+        ),
+    }
+    doc_msg = {
+        "role": "user",
+        "content": _cached_text(
+            _LONG_DOC_SUMMARY_USER.format(
+                doc_name=doc_name,
+                doc_id=doc_id,
+                content=summary_content,
+            )
+        ),
+    }
 
     # --- Step 1: Generate overview ---
-    overview = _llm_call(model, [system_msg, doc_msg], "overview")
+    overview = _llm_call(model, [system_msg, doc_msg], "overview", kb_dir=kb_dir)
 
     # --- Steps 2-4: Concept plan → generate/update → index ---
     await _compile_concepts(
-        wiki_dir, kb_dir, model, system_msg, doc_msg,
-        overview, doc_name, max_concurrency, doc_brief=doc_description,
+        wiki_dir,
+        kb_dir,
+        model,
+        system_msg,
+        doc_msg,
+        overview,
+        doc_name,
+        max_concurrency,
+        doc_brief=doc_description,
         doc_type="pageindex",
     )

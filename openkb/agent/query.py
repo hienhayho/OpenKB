@@ -1,11 +1,16 @@
 """Q&A agent for querying the OpenKB knowledge base."""
+
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
-from agents import Agent, Runner, function_tool
+from agno.agent import Agent
+from agno.models.message import Message
+from agno.models.openai.like import OpenAILike
+from agno.tools import tool
 
-from agents import ToolOutputImage, ToolOutputText
 from openkb.agent.tools import (
     get_wiki_page_content,
     read_wiki_file,
@@ -17,41 +22,78 @@ MAX_TURNS = 50
 from openkb.schema import get_agents_md
 
 _QUERY_INSTRUCTIONS_TEMPLATE = """\
-You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching the wiki.
+You are OpenKB, a knowledge-base Q&A agent. Answer questions by retrieving wiki content \
+using the tools below. Never answer from memory — always read the relevant pages first.
 
 {schema_md}
 
-## Search strategy
-1. Read index.md to see all documents and concepts with brief summaries.
-   Each document is marked (short) or (pageindex) to indicate its type.
-2. Read relevant summary pages (summaries/) for document overviews.
-   Summaries may omit details — if you need more, follow the summary's
-   `full_text` frontmatter field to the source (see step 4).
-3. Read concept pages (concepts/) for cross-document synthesis.
-4. When you need detailed source document content, each summary page has a
-   `full_text` frontmatter field with the path to the original document content:
-   - Short documents (doc_type: short): read_file with that path.
-   - PageIndex documents (doc_type: pageindex): use get_page_content(doc_name, pages)
-     with tight page ranges. The summary shows document tree structure with page
-     ranges to help you target. Never fetch the whole document.
-5. Source content may reference images (e.g. ![image](sources/images/doc/file.png)).
-   Use the get_image tool to view them when needed.
-6. Synthesize a clear, concise, well-cited answer grounded in wiki content.
+## Tools
+- `read_file(path)` — read any Markdown file relative to wiki root
+- `get_page_content(doc_name, pages)` — fetch specific pages from a long (pageindex) document; \
+  use tight ranges (e.g. "3-5,9"), never the whole doc
+- `get_image(image_path)` — view an image referenced in source content
 
-Answer based only on wiki content. Be concise.
-Before each tool call, output one short sentence explaining the reason.
+## When to call which tool
 
-If you cannot find relevant information, say so clearly.
+| Situation | Call |
+|-----------|------|
+| Start of every query | `read_file("index.md")` — always first |
+| Need doc overview | `read_file("summaries/<doc>.md")` |
+| Need cross-doc synthesis | `read_file("concepts/<slug>.md")` |
+| Need full text of a short doc | `read_file(<full_text path from summary frontmatter>)` |
+| Need specific pages of a long doc | `get_page_content(<doc_name>, <pages>)` — check summary tree for page ranges |
+| Answer mentions a figure/chart | `get_image(<path from source content>)` |
+
+## Rules
+- ALWAYS call `read_file("index.md")` first — it maps all docs and concepts.
+- Read summaries before source content; source only when summary is insufficient.
+- For pageindex docs use `get_page_content`, never `read_file` on the source JSON.
+- Stop retrieving once you have enough to answer — do not fetch speculatively.
+- Cite sources as [[summaries/doc]] or [[concepts/slug]] inline in your answer.
+- If information is not in the wiki, say so — do not invent.
 """
 
 
-def build_query_agent(wiki_root: str, model: str, language: str = "en") -> Agent:
+def _make_model(kb_dir: Path | None = None) -> OpenAILike:
+    """Build OpenAILike from KB config or env vars."""
+    import os
+    from openkb.config import load_config
+
+    cfg: dict = {}
+    if kb_dir is not None:
+        config_path = kb_dir / ".openkb" / "config.yaml"
+        if config_path.exists():
+            cfg = load_config(config_path)
+
+    model_id = cfg.get("openai_model_name") or os.environ.get(
+        "OPENAI_MODEL_NAME", "gpt-4o-mini"
+    )
+    base_url = cfg.get("openai_base_url") or os.environ.get(
+        "OPENAI_BASE_URL", "https://api.openai.com/v1"
+    )
+    api_key = cfg.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
+    _extra_body_env = os.environ.get("OPENAI_EXTRA_BODY", "")
+    extra_body = cfg.get("openai_extra_body") or (
+        json.loads(_extra_body_env) if _extra_body_env else {}
+    )
+
+    return OpenAILike(
+        id=model_id,
+        base_url=base_url,
+        api_key=api_key,
+        extra_body=extra_body,
+    )
+
+
+def build_query_agent(
+    wiki_root: str, model: str, language: str = "en", kb_dir: Path | None = None
+) -> Agent:
     """Build and return the Q&A agent."""
     schema_md = get_agents_md(Path(wiki_root))
     instructions = _QUERY_INSTRUCTIONS_TEMPLATE.format(schema_md=schema_md)
     instructions += f"\n\nIMPORTANT: Answer in {language} language."
 
-    @function_tool
+    @tool
     def read_file(path: str) -> str:
         """Read a Markdown file from the wiki.
         Args:
@@ -59,7 +101,7 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en") -> Agent
         """
         return read_wiki_file(path, wiki_root)
 
-    @function_tool
+    @tool
     def get_page_content(doc_name: str, pages: str) -> str:
         """Get text content of specific pages from a PageIndex (long) document.
         Only use for documents with doc_type: pageindex. For short documents,
@@ -70,8 +112,8 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en") -> Agent
         """
         return get_wiki_page_content(doc_name, pages, wiki_root)
 
-    @function_tool
-    def get_image(image_path: str) -> ToolOutputImage | ToolOutputText:
+    @tool
+    def get_image(image_path: str) -> str:
         """View an image from the wiki.
 
         Use when a question asks about a specific figure, chart, or diagram
@@ -82,17 +124,15 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en") -> Agent
         """
         result = read_wiki_image(image_path, wiki_root)
         if result["type"] == "image":
-            return ToolOutputImage(image_url=result["image_url"])
-        return ToolOutputText(text=result["text"])
-
-    from agents.model_settings import ModelSettings
+            return result["image_url"]
+        return result["text"]
 
     return Agent(
         name="wiki-query",
         instructions=instructions,
         tools=[read_file, get_page_content, get_image],
-        model=f"litellm/{model}",
-        model_settings=ModelSettings(parallel_tool_calls=False),
+        model=_make_model(kb_dir),
+        debug_mode=True,
     )
 
 
@@ -103,17 +143,12 @@ def build_chat_agent(
 ) -> Agent:
     """Build the chat agent: query agent + a write tool restricted to
     ``<kb>/wiki/explorations/**`` and ``<kb>/output/**``.
-
-    This is the variant used by the interactive ``openkb chat`` REPL so users
-    can iterate on generated artifacts (e.g. ``output/skills/<name>/``) via
-    natural-language follow-ups without giving the agent unrestricted write
-    access to the wiki.
     """
     wiki_root = str(kb_dir / "wiki")
     kb_root = str(kb_dir)
-    base = build_query_agent(wiki_root, model, language=language)
+    base = build_query_agent(wiki_root, model, language=language, kb_dir=kb_dir)
 
-    @function_tool
+    @tool
     def write_file(path: str, content: str) -> str:
         """Write a text file under the KB.
 
@@ -141,22 +176,8 @@ async def run_query(
     *,
     raw: bool = False,
 ) -> str:
-    """Run a Q&A query against the knowledge base.
-
-    Args:
-        question: The user's question.
-        kb_dir: Root of the knowledge base.
-        model: LLM model name.
-        stream: If True, print response tokens to stdout as they arrive.
-        raw: If True, write raw markdown source instead of rendering it
-            (still keeps tool-call line styling).
-
-    Returns:
-        The agent's final answer as a string.
-    """
+    """Run a Q&A query against the knowledge base."""
     import sys
-    from agents import RawResponsesStreamEvent, RunItemStreamEvent
-    from openai.types.responses import ResponseTextDeltaEvent
     from openkb.config import load_config
 
     openkb_dir = kb_dir / ".openkb"
@@ -164,14 +185,14 @@ async def run_query(
     language: str = config.get("language", "en")
 
     wiki_root = str(kb_dir / "wiki")
-
-    agent = build_query_agent(wiki_root, model, language=language)
+    agent = build_query_agent(wiki_root, model, language=language, kb_dir=kb_dir)
 
     if not stream:
-        result = await Runner.run(agent, question, max_turns=MAX_TURNS)
-        return result.final_output or ""
+        result = await agent.arun(input=Message(role="user", content=question))
+        return result.content or ""
 
     import os
+
     use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR", "")
 
     from openkb.agent.chat import (
@@ -201,63 +222,64 @@ async def run_query(
     live: Live | None = None
     last_was_text = False
     need_blank_before_text = False
-    result = Runner.run_streamed(agent, question, max_turns=MAX_TURNS)
     collected: list[str] = []
     segment: list[str] = []
+
     try:
         live = _start_live()
-        async for event in result.stream_events():
-            if isinstance(event, RawResponsesStreamEvent):
-                if isinstance(event.data, ResponseTextDeltaEvent):
-                    text = event.data.delta
-                    if text:
-                        if need_blank_before_text:
-                            if console is not None:
-                                print()
-                                segment = []
-                                live = _start_live()
-                            else:
-                                sys.stdout.write("\n")
-                            need_blank_before_text = False
-                        collected.append(text)
-                        segment.append(text)
-                        last_was_text = True
-                        if live:
-                            if "\n" in text:
-                                joined = "".join(segment)
-                                visible = joined[: joined.rfind("\n") + 1]
-                                if visible:
-                                    live.update(_make_markdown(visible))
-                        else:
-                            sys.stdout.write(text)
-                            sys.stdout.flush()
-            elif isinstance(event, RunItemStreamEvent):
-                item = event.item
-                if item.type == "tool_call_item":
-                    if last_was_text:
-                        if live:
-                            if segment:
-                                live.update(_make_markdown("".join(segment)))
-                            live.stop()
-                            live = None
-                        else:
-                            sys.stdout.write("\n")
-                            sys.stdout.flush()
-                        last_was_text = False
-                    raw_item = item.raw_item
-                    name = getattr(raw_item, "name", "?")
-                    args = getattr(raw_item, "arguments", "") or ""
+        async for event in agent.arun(
+            input=Message(role="user", content=question),
+            stream=True,
+            stream_events=True,
+        ):
+            # agno RunResponseEvent: check content vs tool events
+            content = getattr(event, "content", None)
+            if content and isinstance(content, str):
+                if need_blank_before_text:
+                    if console is not None:
+                        print()
+                        segment = []
+                        live = _start_live()
+                    else:
+                        sys.stdout.write("\n")
+                    need_blank_before_text = False
+                collected.append(content)
+                segment.append(content)
+                last_was_text = True
+                if live and "\n" in content:
+                    joined = "".join(segment)
+                    visible = joined[: joined.rfind("\n") + 1]
+                    if visible:
+                        live.update(_make_markdown(visible))
+                elif not live:
+                    sys.stdout.write(content)
+                    sys.stdout.flush()
+            else:
+                # Tool call event
+                tool_name = getattr(event, "tool_name", None) or getattr(
+                    event, "event", ""
+                )
+                if tool_name and last_was_text:
                     if live:
+                        if segment:
+                            live.update(_make_markdown("".join(segment)))
                         live.stop()
                         live = None
-                    _fmt(style, ("class:tool", _format_tool_line(name, args) + "\n"))
+                    else:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    last_was_text = False
+                    tool_args = str(getattr(event, "tool_args", "") or "")
+                    _fmt(
+                        style,
+                        ("class:tool", _format_tool_line(tool_name, tool_args) + "\n"),
+                    )
                     need_blank_before_text = True
-                elif item.type == "tool_call_output_item":
-                    pass
     finally:
         if live:
             if segment:
                 live.update(_make_markdown("".join(segment)))
             live.stop()
         print()
-    return "".join(collected) if collected else result.final_output or ""
+
+    return "".join(collected) if collected else ""

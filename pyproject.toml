@@ -7,7 +7,7 @@ name = "openkb"
 dynamic = ["version"]
 description = "OpenKB: Open LLM Knowledge Base, powered by PageIndex"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Kylin", email = "quanqi@pageindex.ai"},
@@ -18,7 +18,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -26,18 +25,20 @@ classifiers = [
 ]
 keywords = ["ai", "rag", "retrieval", "knowledge-base", "llm", "pageindex", "agents", "document"]
 dependencies = [
-    "pageindex==0.3.0.dev1",
+    "pageindex",
     "markitdown[docx,pptx,xlsx,xls]>=0.1.5",
     "trafilatura>=2.0",
     "click>=8.0",
     "watchdog>=3.0",
     "litellm",
     "openai-agents",
+    "agno",
     "pyyaml",
     "python-dotenv",
     "json-repair",
     "prompt_toolkit>=3.0",
     "rich>=13.0",
+    "pymupdf>=1.27.2.3",
 ]
 
 [project.urls]
@@ -53,6 +54,9 @@ testpaths = ["tests"]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+
+[tool.uv.sources]
+pageindex = { path = "PageIndex", editable = true }
 
 [tool.hatch.version]
 source = "vcs"

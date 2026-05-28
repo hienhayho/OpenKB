@@ -9,6 +9,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.4-mini",
     "language": "en",
     "pageindex_threshold": 20,
+    "openai_model_name": "",
+    "openai_base_url": "",
+    "openai_api_key": "",
+    "openai_extra_body": {},
 }
 
 GLOBAL_CONFIG_DIR = Path.home() / ".config" / "openkb"
